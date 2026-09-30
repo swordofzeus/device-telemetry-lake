@@ -1,0 +1,105 @@
+# Candidate-owned Compose overlay. Add solution services and overrides here.
+services:
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.9.0
+    ports:
+      - "127.0.0.1:8083:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: forward
+    networks:
+      - challenge
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://localhost:8081/subjects >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  lakehouse-init:
+    build:
+      context: ./ingestion/ready-lakehouse-manager
+    image: ready-lakehouse-manager:latest
+    depends_on:
+      schema-registry:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+    environment:
+      CATALOG_URI: http://nessie:19120/iceberg/
+      WAREHOUSE: warehouse
+      NAMESPACE: solution
+      S3_ENDPOINT: http://garage:3900
+      S3_ACCESS_KEY: "${S3_ACCESS_KEY:-GK0123456789abcdef0123456789abcdef}"
+      S3_SECRET_KEY: "${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      AWS_ACCESS_KEY_ID: "${S3_ACCESS_KEY:-GK0123456789abcdef0123456789abcdef}"
+      AWS_SECRET_ACCESS_KEY: "${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
+      AWS_ENDPOINT_URL: http://garage:3900
+      AWS_DEFAULT_REGION: "${S3_REGION:-garage}"
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        lakehouse-manager create-tables
+        lakehouse-manager load-reference --table sites --csv s3://warehouse/dimension-tables/v1/sites.csv
+        lakehouse-manager load-reference --table devices --csv s3://warehouse/dimension-tables/v1/devices.csv
+        lakehouse-manager load-reference --table device_dependencies --csv s3://warehouse/dimension-tables/v1/device_dependencies.csv
+        lakehouse-manager load-reference --table census_block_groups --csv s3://warehouse/dimension-tables/v1/census_block_groups.csv
+        lakehouse-manager register-schema --topic network.connectivity --schema s3://warehouse/contracts/events/v1/connectivity-metric.v1.schema.json
+        lakehouse-manager register-schema --topic network.throughput --schema s3://warehouse/contracts/events/v1/throughput-test.v1.schema.json
+        lakehouse-manager register-schema --topic network.device_health --schema s3://warehouse/contracts/events/v1/device-health.v1.schema.json
+        lakehouse-manager register-schema --topic network.state --schema s3://warehouse/contracts/events/v1/connectivity-state.v1.schema.json
+        lakehouse-manager register-schema --topic network.infrastructure --schema s3://warehouse/contracts/events/v1/infrastructure-event.v1.schema.json
+    networks:
+      - challenge
+    restart: "no"
+
+  device-ingestion:
+    build:
+      context: ./ingestion/device-ingestion
+    image: device-ingestion:latest
+    depends_on:
+      lakehouse-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_GROUP_ID: "${KAFKA_GROUP_ID:-device-ingestion}"
+      KAFKA_TOPICS: "${KAFKA_TOPICS:-}"
+      CATALOG_URI: http://nessie:19120/iceberg/
+      WAREHOUSE: warehouse
+      NAMESPACE: "${NAMESPACE:-solution}"
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      BATCH_SIZE: "${BATCH_SIZE:-500}"
+      POLL_TIMEOUT: "${POLL_TIMEOUT:-1.0}"
+      FLUSH_INTERVAL: "${FLUSH_INTERVAL:-5.0}"
+      AWS_ACCESS_KEY_ID: "${S3_ACCESS_KEY:-GK0123456789abcdef0123456789abcdef}"
+      AWS_SECRET_ACCESS_KEY: "${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
+      AWS_ENDPOINT_URL: http://garage:3900
+      AWS_DEFAULT_REGION: "${S3_REGION:-garage}"
+    networks:
+      - challenge
+    restart: unless-stopped
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.5.0
+    depends_on:
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8082:8080"
+    environment:
+      DYNAMIC_CONFIG_ENABLED: "true"
+      KAFKA_CLUSTERS_0_NAME: challenge
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+    networks:
+      - challenge
+    restart: unless-stopped
+
+networks:
+  challenge:
+    external: true
+    name: readydata-streaming-challenge_challenge
